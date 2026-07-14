@@ -34,6 +34,7 @@ ALLOWED_ORIGINS = os.environ.get(
 # ─────────────────────────────────────────────────────────────────────────────
 
 FACE_MATCH_THRESHOLD = 0.55  # lower = stricter (0.6 is dlib default)
+THUMBNAIL_MAX_DIM = 900      # longest edge of display thumbnails
 
 
 def make_s3():
@@ -101,10 +102,12 @@ def _save_manifest(manifest: dict) -> None:
     _put_json("manifest.json", manifest)
 
 
-def _identify_faces(encodings: list[np.ndarray]) -> list[str]:
-    """Return names for each encoding (empty string if unrecognised)."""
+def _identify_faces(encodings: list[np.ndarray], label: str = "") -> list[str]:
+    """Return names for each encoding, logging progress face-by-face."""
     names: list[str] = []
-    for enc in encodings:
+    total = len(encodings)
+    prefix = f"[{label}] " if label else ""
+    for i, enc in enumerate(encodings, start=1):
         best_name = ""
         best_dist = FACE_MATCH_THRESHOLD
         for name, known_encs in known_faces.items():
@@ -115,6 +118,10 @@ def _identify_faces(encodings: list[np.ndarray]) -> list[str]:
             if d < best_dist:
                 best_dist = d
                 best_name = name
+        if best_name:
+            print(f"{prefix}face {i}/{total} → {best_name} (dist {best_dist:.3f})")
+        else:
+            print(f"{prefix}face {i}/{total} → no match (closest dist {best_dist:.3f})")
         names.append(best_name)
     return names
 
@@ -175,8 +182,18 @@ class ProcessUploadRequest(BaseModel):
 MAX_RECOGNITION_DIM = 1000  # downscale before face recognition to stay within 512MB RAM
 
 
+def _make_thumbnail(img_bytes: bytes) -> tuple[bytes, int, int]:
+    """Return (jpeg_bytes, width, height) for the thumbnail."""
+    pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    if max(pil.size) > THUMBNAIL_MAX_DIM:
+        pil.thumbnail((THUMBNAIL_MAX_DIM, THUMBNAIL_MAX_DIM), Image.LANCZOS)
+    buf = io.BytesIO()
+    pil.save(buf, format="JPEG", quality=85)
+    return buf.getvalue(), pil.width, pil.height
+
+
 def _do_process_upload(body: ProcessUploadRequest) -> None:
-    """Runs in background — download photo, tag faces, update manifest."""
+    """Runs in background — download photo, create thumbnail, tag faces, update manifest."""
     try:
         obj = s3.get_object(Bucket=R2_BUCKET, Key=body.key)
         img_bytes = obj["Body"].read()
@@ -186,10 +203,21 @@ def _do_process_upload(body: ProcessUploadRequest) -> None:
 
     # Get true dimensions from the original image
     try:
-        pil_img = Image.open(io.BytesIO(img_bytes))
-        width, height = pil_img.size
+        pil_orig = Image.open(io.BytesIO(img_bytes))
+        orig_width, orig_height = pil_orig.size
     except Exception:
-        width, height = body.width, body.height
+        orig_width, orig_height = body.width, body.height
+
+    # Generate and upload thumbnail
+    thumb_url = None
+    try:
+        thumb_bytes, thumb_w, thumb_h = _make_thumbnail(img_bytes)
+        thumb_key = "thumbnails/" + body.key.split("/", 1)[-1]
+        s3.put_object(Bucket=R2_BUCKET, Key=thumb_key, Body=thumb_bytes, ContentType="image/jpeg")
+        thumb_url = f"{R2_PUBLIC_URL}/{thumb_key}"
+    except Exception as exc:
+        print(f"[warn] thumbnail generation failed: {exc}")
+        thumb_w, thumb_h = orig_width, orig_height
 
     # Add photo to manifest immediately so it shows in the gallery even if face
     # recognition crashes below.
@@ -199,15 +227,18 @@ def _do_process_upload(body: ProcessUploadRequest) -> None:
     if photo_url not in existing_urls:
         manifest["photos"].append({
             "url": photo_url,
-            "width": width,
-            "height": height,
+            "thumbnail": thumb_url,
+            "width": thumb_w,
+            "height": thumb_h,
             "people": [],
+            "indexed": False,
             "uploader": body.uploader,
         })
         _save_manifest(manifest)
         print(f"[manifest] added {body.key} (face tagging pending)")
 
     # Downscale before recognition to avoid OOM on large photos
+    slug = body.key.split("/")[-1]
     try:
         pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         if max(pil_img.size) > MAX_RECOGNITION_DIM:
@@ -215,24 +246,26 @@ def _do_process_upload(body: ProcessUploadRequest) -> None:
         buf = io.BytesIO()
         pil_img.save(buf, format="JPEG", quality=90)
         buf.seek(0)
+        print(f"[{slug}] detecting faces…")
         img_array = face_recognition.load_image_file(buf)
         encodings = face_recognition.face_encodings(img_array)
-        identified = _identify_faces(encodings)
+        print(f"[{slug}] found {len(encodings)} face(s), identifying…")
+        identified = _identify_faces(encodings, label=slug)
         people_in_photo = sorted({n for n in identified if n})
     except Exception as exc:
         print(f"[warn] face recognition failed for {body.key}: {exc}")
         people_in_photo = []
 
-    # Update manifest entry with recognised people
-    if people_in_photo:
-        manifest = _load_manifest()
-        for photo in manifest["photos"]:
-            if photo["url"] == photo_url:
-                photo["people"] = people_in_photo
-                break
-        all_people = set(manifest.get("people", [])) | set(people_in_photo)
-        manifest["people"] = sorted(all_people)
-        _save_manifest(manifest)
+    # Update manifest entry: mark indexed, add people
+    manifest = _load_manifest()
+    for photo in manifest["photos"]:
+        if photo["url"] == photo_url:
+            photo["people"] = people_in_photo
+            photo["indexed"] = True
+            break
+    all_people = set(manifest.get("people", [])) | set(people_in_photo)
+    manifest["people"] = sorted(all_people)
+    _save_manifest(manifest)
 
     print(f"[done] {body.key} → {people_in_photo or '(no face matches)'}")
 

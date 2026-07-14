@@ -16,7 +16,7 @@ import boto3
 import face_recognition
 import numpy as np
 from botocore.config import Config
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 from pydantic import BaseModel
@@ -133,8 +133,8 @@ app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_origins=["*"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
@@ -172,23 +172,21 @@ class ProcessUploadRequest(BaseModel):
     height: int = 0
 
 
-@app.post("/process-upload")
-def process_upload(body: ProcessUploadRequest):
-    # Download from R2
+def _do_process_upload(body: ProcessUploadRequest) -> None:
+    """Runs in background — download photo, tag faces, update manifest."""
     try:
         obj = s3.get_object(Bucket=R2_BUCKET, Key=body.key)
         img_bytes = obj["Body"].read()
     except Exception as exc:
-        raise HTTPException(status_code=404, detail=f"Object not found: {exc}")
+        print(f"[error] could not download {body.key}: {exc}")
+        return
 
-    # Get dimensions from PIL (use client-supplied dims as fallback)
     try:
         pil_img = Image.open(io.BytesIO(img_bytes))
         width, height = pil_img.size
     except Exception:
         width, height = body.width, body.height
 
-    # Run face recognition
     try:
         img_array = face_recognition.load_image_file(io.BytesIO(img_bytes))
         encodings = face_recognition.face_encodings(img_array)
@@ -198,7 +196,6 @@ def process_upload(body: ProcessUploadRequest):
         print(f"[warn] face recognition failed for {body.key}: {exc}")
         people_in_photo = []
 
-    # Update manifest
     manifest = _load_manifest()
     photo_url = f"{R2_PUBLIC_URL}/{body.key}"
 
@@ -215,7 +212,14 @@ def process_upload(body: ProcessUploadRequest):
         manifest["people"] = sorted(all_people)
         _save_manifest(manifest)
 
-    return {"people_detected": people_in_photo, "photo_url": photo_url}
+    print(f"[done] {body.key} → {people_in_photo or '(no matches)'}")
+
+
+@app.post("/process-upload")
+def process_upload(body: ProcessUploadRequest, background_tasks: BackgroundTasks):
+    """Returns immediately; face recognition runs in the background."""
+    background_tasks.add_task(_do_process_upload, body)
+    return {"status": "queued", "key": body.key}
 
 
 @app.post("/reindex")

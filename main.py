@@ -35,7 +35,8 @@ ALLOWED_ORIGINS = os.environ.get(
 ).split(",")
 # ─────────────────────────────────────────────────────────────────────────────
 
-FACE_MATCH_THRESHOLD = 0.55  # lower = stricter (0.6 is dlib default)
+FACE_MATCH_THRESHOLD = 0.62  # dlib default is 0.6; slightly liberal for group photos
+FACE_VOTE_TOP_K = 5          # use the K closest encodings per person when voting
 THUMBNAIL_MAX_DIM = 900      # longest edge of display thumbnails
 
 # Try these resolutions in order; below 600px we switch to patch mode instead.
@@ -113,27 +114,67 @@ def _save_manifest(manifest: dict) -> None:
 
 
 def _identify_faces(encodings: list[np.ndarray], label: str = "") -> list[str]:
-    """Return names for each encoding, logging progress face-by-face."""
+    """Identify each encoding using weighted voting across all known samples.
+
+    For each candidate person we take their FACE_VOTE_TOP_K closest encodings,
+    keep only those within FACE_MATCH_THRESHOLD, and sum (1 - distance) as a
+    confidence score.  This exploits having many training samples per person and
+    is more robust than a single nearest-neighbour lookup.
+    """
     names: list[str] = []
     total = len(encodings)
     prefix = f"[{label}] " if label else ""
+
     for i, enc in enumerate(encodings, start=1):
         best_name = ""
-        best_dist = FACE_MATCH_THRESHOLD
+        best_score = 0.0
+
         for name, known_encs in known_faces.items():
             if not known_encs:
                 continue
             dists = face_recognition.face_distance(known_encs, enc)
-            d = float(np.min(dists))
-            if d < best_dist:
-                best_dist = d
+            # Top-K closest, then filter by threshold
+            top_k = np.sort(dists)[:FACE_VOTE_TOP_K]
+            within = top_k[top_k < FACE_MATCH_THRESHOLD]
+            if len(within) == 0:
+                continue
+            score = float(np.sum(1.0 - within))  # higher → more/closer matches
+            if score > best_score:
+                best_score = score
                 best_name = name
+
         if best_name:
-            print(f"{prefix}face {i}/{total} → {best_name} (dist {best_dist:.3f})")
+            print(f"{prefix}face {i}/{total} → {best_name} (score {best_score:.3f})")
         else:
-            print(f"{prefix}face {i}/{total} → no match (closest dist {best_dist:.3f})")
+            # Log the single closest person even when unmatched, to help tune threshold
+            closest_name, closest_dist = "", 1.0
+            for name, known_encs in known_faces.items():
+                if not known_encs:
+                    continue
+                d = float(np.min(face_recognition.face_distance(known_encs, enc)))
+                if d < closest_dist:
+                    closest_dist = d
+                    closest_name = name
+            print(f"{prefix}face {i}/{total} → no match "
+                  f"(closest: {closest_name or 'none'} @ {closest_dist:.3f})")
         names.append(best_name)
+
     return names
+
+
+def _detect_faces(img_array: "np.ndarray", slug: str) -> list:
+    """Detect face locations, trying upsample=2 first (finds smaller faces).
+    Falls back to upsample=1 on OOM."""
+    try:
+        locs = face_recognition.face_locations(img_array, number_of_times_to_upsample=2, model="hog")
+        print(f"[{slug}] detected {len(locs)} face(s) (upsample=2)")
+        return locs
+    except MemoryError:
+        _oom_alert(slug, "OOM with upsample=2 during detection — falling back to upsample=1")
+        gc.collect()
+        locs = face_recognition.face_locations(img_array, number_of_times_to_upsample=1, model="hog")
+        print(f"[{slug}] detected {len(locs)} face(s) (upsample=1)")
+        return locs
 
 
 def _oom_alert(slug: str, detail: str) -> None:
@@ -185,8 +226,7 @@ def _try_at_dim(img_bytes: bytes, max_dim: int, slug: str) -> list["np.ndarray"]
     """Attempt full-image recognition at max_dim. May raise MemoryError."""
     gc.collect()
     img_array = _load_resized(img_bytes, max_dim)
-    locations = face_recognition.face_locations(img_array, model="hog")
-    print(f"[{slug}] {max_dim}px → {len(locations)} face(s) detected")
+    locations = _detect_faces(img_array, slug)
     encodings = _encode_one_by_one(img_array, locations, slug)
     del img_array
     gc.collect()
@@ -226,8 +266,7 @@ def _recognize_patches(img_bytes: bytes, slug: str) -> list[str]:
             del patch_pil
 
             patch_arr = face_recognition.load_image_file(buf)
-            locs = face_recognition.face_locations(patch_arr, model="hog")
-            print(f"[{slug}] patch {pi}/{len(patches)}: {len(locs)} face(s)")
+            locs = _detect_faces(patch_arr, f"{slug}/p{pi}")
 
             for loc in locs:
                 top, right, bottom, left = loc

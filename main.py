@@ -5,9 +5,11 @@ Handles presigned upload URLs and face-recognition tagging.
 
 from __future__ import annotations
 
+import gc
 import io
 import json
 import os
+import threading
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any
@@ -35,6 +37,14 @@ ALLOWED_ORIGINS = os.environ.get(
 
 FACE_MATCH_THRESHOLD = 0.55  # lower = stricter (0.6 is dlib default)
 THUMBNAIL_MAX_DIM = 900      # longest edge of display thumbnails
+
+# Try these resolutions in order; below 600px we switch to patch mode instead.
+_RECOGNITION_DIMS = [800, 600]
+_PATCH_DIM = 500       # each patch is at most this wide/tall
+_PATCH_OVERLAP = 0.15  # fraction of overlap between adjacent patches
+
+# Only one recognition job runs at a time to stay within 512 MB RAM.
+_recognition_lock = threading.Semaphore(1)
 
 
 def make_s3():
@@ -124,6 +134,149 @@ def _identify_faces(encodings: list[np.ndarray], label: str = "") -> list[str]:
             print(f"{prefix}face {i}/{total} → no match (closest dist {best_dist:.3f})")
         names.append(best_name)
     return names
+
+
+def _oom_alert(slug: str, detail: str) -> None:
+    bar = "=" * 60
+    print(f"\n{bar}")
+    print(f"  ⚠️  OOM ERROR — {slug}")
+    print(f"  {detail}")
+    print(f"{bar}\n")
+
+
+def _load_resized(img_bytes: bytes, max_dim: int) -> "np.ndarray":
+    pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    if max(pil.size) > max_dim:
+        pil.thumbnail((max_dim, max_dim), Image.LANCZOS)
+    buf = io.BytesIO()
+    pil.save(buf, format="JPEG", quality=85)
+    buf.seek(0)
+    del pil
+    gc.collect()
+    return face_recognition.load_image_file(buf)
+
+
+def _encode_one_by_one(img_array: "np.ndarray", locations: list, slug: str) -> list["np.ndarray"]:
+    """Encode faces one at a time to cap peak memory per face."""
+    encodings: list[np.ndarray] = []
+    for i, loc in enumerate(locations, start=1):
+        enc = face_recognition.face_encodings(img_array, [loc])
+        if enc:
+            encodings.append(enc[0])
+        print(f"[{slug}] encoded face {i}/{len(locations)}")
+        gc.collect()
+    return encodings
+
+
+def _iou(a: tuple, b: tuple) -> float:
+    """Intersection-over-union for two (top, right, bottom, left) boxes."""
+    t = max(a[0], b[0]); r = min(a[1], b[1])
+    bo = min(a[2], b[2]); l = max(a[3], b[3])
+    if bo <= t or r <= l:
+        return 0.0
+    inter = (bo - t) * (r - l)
+    area_a = (a[2] - a[0]) * (a[1] - a[3])
+    area_b = (b[2] - b[0]) * (b[1] - b[3])
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _try_at_dim(img_bytes: bytes, max_dim: int, slug: str) -> list["np.ndarray"]:
+    """Attempt full-image recognition at max_dim. May raise MemoryError."""
+    gc.collect()
+    img_array = _load_resized(img_bytes, max_dim)
+    locations = face_recognition.face_locations(img_array, model="hog")
+    print(f"[{slug}] {max_dim}px → {len(locations)} face(s) detected")
+    encodings = _encode_one_by_one(img_array, locations, slug)
+    del img_array
+    gc.collect()
+    return encodings
+
+
+def _recognize_patches(img_bytes: bytes, slug: str) -> list[str]:
+    """Patch-based fallback: tile the image and merge results across patches."""
+    print(f"[{slug}] switching to patch mode (patch_dim={_PATCH_DIM}px)")
+    gc.collect()
+
+    pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    # Keep overall image at 2× patch size so patches are meaningful
+    max_overall = _PATCH_DIM * 2
+    if max(pil.size) > max_overall:
+        pil.thumbnail((max_overall, max_overall), Image.LANCZOS)
+    W, H = pil.size
+
+    # Build patch grid with overlap
+    stride = int(_PATCH_DIM * (1 - _PATCH_OVERLAP))
+    xs = list(range(0, W - 1, stride)) if W > _PATCH_DIM else [0]
+    ys = list(range(0, H - 1, stride)) if H > _PATCH_DIM else [0]
+
+    patches = [(x, y, min(x + _PATCH_DIM, W), min(y + _PATCH_DIM, H)) for y in ys for x in xs]
+    print(f"[{slug}] {len(patches)} patches over {W}×{H} image")
+
+    global_locs: list[tuple] = []
+    all_encodings: list[np.ndarray] = []
+
+    for pi, (x1, y1, x2, y2) in enumerate(patches, start=1):
+        try:
+            gc.collect()
+            patch_pil = pil.crop((x1, y1, x2, y2))
+            buf = io.BytesIO()
+            patch_pil.save(buf, format="JPEG", quality=85)
+            buf.seek(0)
+            del patch_pil
+
+            patch_arr = face_recognition.load_image_file(buf)
+            locs = face_recognition.face_locations(patch_arr, model="hog")
+            print(f"[{slug}] patch {pi}/{len(patches)}: {len(locs)} face(s)")
+
+            for loc in locs:
+                top, right, bottom, left = loc
+                g_loc = (top + y1, right + x1, bottom + y1, left + x1)
+                if any(_iou(g_loc, gl) > 0.3 for gl in global_locs):
+                    continue  # duplicate across patch boundary
+                enc = face_recognition.face_encodings(patch_arr, [loc])
+                if enc:
+                    global_locs.append(g_loc)
+                    all_encodings.append(enc[0])
+                gc.collect()
+
+            del patch_arr
+            gc.collect()
+
+        except MemoryError:
+            _oom_alert(slug, f"OOM inside patch {pi}/{len(patches)} — patch skipped")
+            gc.collect()
+
+    del pil
+    gc.collect()
+    print(f"[{slug}] patch mode done: {len(all_encodings)} unique face(s)")
+    return _identify_faces(all_encodings, label=slug)
+
+
+def _recognize_faces_safe(img_bytes: bytes, slug: str) -> list[str]:
+    """Try full-image recognition at each resolution; fall back to patch mode on OOM."""
+    for dim in _RECOGNITION_DIMS:
+        try:
+            encodings = _try_at_dim(img_bytes, dim, slug)
+            return _identify_faces(encodings, label=slug)
+        except MemoryError:
+            _oom_alert(slug, f"OOM at {dim}px full-image — trying next resolution")
+            gc.collect()
+        except Exception as exc:
+            print(f"[{slug}] recognition error at {dim}px: {exc}")
+            return []
+
+    # All full-image attempts failed — go to patch mode
+    _oom_alert(slug, "OOM at all full-image resolutions — switching to patch mode")
+    try:
+        return _recognize_patches(img_bytes, slug)
+    except MemoryError:
+        _oom_alert(slug, "OOM even in patch mode — photo saved without face tags")
+        gc.collect()
+        return []
+    except Exception as exc:
+        print(f"[{slug}] patch mode error: {exc}")
+        return []
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
@@ -237,24 +390,11 @@ def _do_process_upload(body: ProcessUploadRequest) -> None:
         _save_manifest(manifest)
         print(f"[manifest] added {body.key} (face tagging pending)")
 
-    # Downscale before recognition to avoid OOM on large photos
     slug = body.key.split("/")[-1]
-    try:
-        pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        if max(pil_img.size) > MAX_RECOGNITION_DIM:
-            pil_img.thumbnail((MAX_RECOGNITION_DIM, MAX_RECOGNITION_DIM), Image.LANCZOS)
-        buf = io.BytesIO()
-        pil_img.save(buf, format="JPEG", quality=90)
-        buf.seek(0)
-        print(f"[{slug}] detecting faces…")
-        img_array = face_recognition.load_image_file(buf)
-        encodings = face_recognition.face_encodings(img_array)
-        print(f"[{slug}] found {len(encodings)} face(s), identifying…")
-        identified = _identify_faces(encodings, label=slug)
+    print(f"[{slug}] waiting for recognition slot…")
+    with _recognition_lock:
+        identified = _recognize_faces_safe(img_bytes, slug)
         people_in_photo = sorted({n for n in identified if n})
-    except Exception as exc:
-        print(f"[warn] face recognition failed for {body.key}: {exc}")
-        people_in_photo = []
 
     # Update manifest entry: mark indexed, add people
     manifest = _load_manifest()
@@ -287,14 +427,13 @@ def reindex():
 
     for photo in manifest["photos"]:
         try:
-            # Extract key from URL
             key = photo["url"].replace(f"{R2_PUBLIC_URL}/", "")
+            slug = key.split("/")[-1]
             obj = s3.get_object(Bucket=R2_BUCKET, Key=key)
             img_bytes = obj["Body"].read()
-            img_array = face_recognition.load_image_file(io.BytesIO(img_bytes))
-            encodings = face_recognition.face_encodings(img_array)
-            identified = _identify_faces(encodings)
+            identified = _recognize_faces_safe(img_bytes, slug)
             photo["people"] = sorted({n for n in identified if n})
+            photo["indexed"] = True
             updated += 1
         except Exception as exc:
             print(f"[warn] reindex failed for {photo.get('url')}: {exc}")

@@ -172,6 +172,9 @@ class ProcessUploadRequest(BaseModel):
     height: int = 0
 
 
+MAX_RECOGNITION_DIM = 1000  # downscale before face recognition to stay within 512MB RAM
+
+
 def _do_process_upload(body: ProcessUploadRequest) -> None:
     """Runs in background — download photo, tag faces, update manifest."""
     try:
@@ -181,14 +184,38 @@ def _do_process_upload(body: ProcessUploadRequest) -> None:
         print(f"[error] could not download {body.key}: {exc}")
         return
 
+    # Get true dimensions from the original image
     try:
         pil_img = Image.open(io.BytesIO(img_bytes))
         width, height = pil_img.size
     except Exception:
         width, height = body.width, body.height
 
+    # Add photo to manifest immediately so it shows in the gallery even if face
+    # recognition crashes below.
+    photo_url = f"{R2_PUBLIC_URL}/{body.key}"
+    manifest = _load_manifest()
+    existing_urls = {p["url"] for p in manifest["photos"]}
+    if photo_url not in existing_urls:
+        manifest["photos"].append({
+            "url": photo_url,
+            "width": width,
+            "height": height,
+            "people": [],
+            "uploader": body.uploader,
+        })
+        _save_manifest(manifest)
+        print(f"[manifest] added {body.key} (face tagging pending)")
+
+    # Downscale before recognition to avoid OOM on large photos
     try:
-        img_array = face_recognition.load_image_file(io.BytesIO(img_bytes))
+        pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        if max(pil_img.size) > MAX_RECOGNITION_DIM:
+            pil_img.thumbnail((MAX_RECOGNITION_DIM, MAX_RECOGNITION_DIM), Image.LANCZOS)
+        buf = io.BytesIO()
+        pil_img.save(buf, format="JPEG", quality=90)
+        buf.seek(0)
+        img_array = face_recognition.load_image_file(buf)
         encodings = face_recognition.face_encodings(img_array)
         identified = _identify_faces(encodings)
         people_in_photo = sorted({n for n in identified if n})
@@ -196,23 +223,18 @@ def _do_process_upload(body: ProcessUploadRequest) -> None:
         print(f"[warn] face recognition failed for {body.key}: {exc}")
         people_in_photo = []
 
-    manifest = _load_manifest()
-    photo_url = f"{R2_PUBLIC_URL}/{body.key}"
-
-    existing_urls = {p["url"] for p in manifest["photos"]}
-    if photo_url not in existing_urls:
-        manifest["photos"].append({
-            "url": photo_url,
-            "width": width,
-            "height": height,
-            "people": people_in_photo,
-            "uploader": body.uploader,
-        })
+    # Update manifest entry with recognised people
+    if people_in_photo:
+        manifest = _load_manifest()
+        for photo in manifest["photos"]:
+            if photo["url"] == photo_url:
+                photo["people"] = people_in_photo
+                break
         all_people = set(manifest.get("people", [])) | set(people_in_photo)
         manifest["people"] = sorted(all_people)
         _save_manifest(manifest)
 
-    print(f"[done] {body.key} → {people_in_photo or '(no matches)'}")
+    print(f"[done] {body.key} → {people_in_photo or '(no face matches)'}")
 
 
 @app.post("/process-upload")

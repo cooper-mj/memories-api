@@ -1,19 +1,13 @@
 FROM python:3.11-slim
 
-# dlib (required by face_recognition) needs cmake + build tools
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    cmake \
-    libopenblas-dev \
-    liblapack-dev \
-    libx11-dev \
-    && rm -rf /var/lib/apt/lists/*
-
 WORKDIR /app
 COPY requirements.txt .
 
-# Build dlib wheel first (slow, ~5 min) then the rest
-RUN pip install --no-cache-dir cmake dlib
+# dlib-bin provides a pre-compiled dlib wheel — no cmake or C++ compilation needed.
+# Install it first, then face_recognition with --no-deps so pip doesn't try to
+# rebuild dlib from source to satisfy the dependency.
+RUN pip install --no-cache-dir dlib-bin face_recognition_models
+RUN pip install --no-cache-dir face_recognition --no-deps
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
